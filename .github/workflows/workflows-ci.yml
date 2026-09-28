@@ -1,0 +1,69 @@
+# =============================================================================
+# CI do proprio repositorio de workflows.
+#
+# Os workflows reutilizaveis daqui rodam no CI de TODOS os projetos. Um erro
+# aqui quebra todo mundo de uma vez — por isso lint e testes sao obrigatorios.
+# =============================================================================
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # As convencoes deste repositorio sao validadas pela versao DESTE commit das
+  # regras, nao pela v1 publicada — assim um PR que muda a regra se testa.
+  conventions:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/conventions.yml
+    with:
+      tooling-ref: ${{ github.event.pull_request.head.sha }}
+
+  workflows:
+    name: Lint dos workflows (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color
+
+  tooling:
+    name: Testes das regras de convencao
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sintaxe POSIX
+        run: for f in tooling/*.sh; do sh -n "$f" && echo "ok  $f"; done
+      - name: Testes (dash)
+        run: sh tooling/test-conventions.sh
+      - name: Testes (busybox)
+        run: docker run --rm -v "$PWD/tooling:/t:ro" alpine:3.20 sh /t/test-conventions.sh
+
+  ci-success:
+    name: ci-success
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [conventions, workflows, tooling]
+    steps:
+      - name: Falha se qualquer job obrigatorio nao passou
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Resultados: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::Um job obrigatorio terminou como '$result'."; exit 1 ;;
+            esac
+          done

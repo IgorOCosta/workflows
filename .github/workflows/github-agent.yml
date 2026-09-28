@@ -1,0 +1,459 @@
+# =============================================================================
+# REUTILIZAVEL — Agente de automacao do GitHub (determinístico, sem IA).
+#
+# Divisao de responsabilidade com o CI:
+#   ci.yml           -> ENFORCEMENT. Falha e bloqueia o merge.
+#   github-agent.yml -> FEEDBACK. Comenta, rotula, organiza. Nunca bloqueia.
+#
+# O que faz:
+#   1. Rotula issues por conteudo (labels canonicas do CONVENCOES.md)
+#   2. Adiciona issues e PRs a um GitHub Project
+#   3. Comenta o diagnostico de convencoes (mesmas regras do CI) e sugere
+#      reviewers a partir do CODEOWNERS
+#   4. Publica o resultado do CI e a cobertura como comentario fixo no PR
+#   5. Fecha issues referenciadas por "Closes #N" no merge, inclusive nos
+#      casos que o GitHub nao cobre sozinho
+#
+# Comentarios sao "fixos": cada tipo tem um marcador e e ATUALIZADO a cada
+# push, nunca duplicado.
+#
+# PR de fork e do Dependabot recebem GITHUB_TOKEN somente-leitura: os jobs que
+# escrevem sao pulados, em vez de usar `pull_request_target`.
+#
+# Uso: ver .github/workflows/github-agent.yml de qualquer template.
+# =============================================================================
+name: GitHub Agent
+
+on:
+  workflow_call:
+    inputs:
+      project-url:
+        description: URL do GitHub Project (v2). Vazio = passo do Project pulado.
+        type: string
+        default: ''
+      coverage-threshold:
+        description: Meta de cobertura exibida no comentario (so sinalizacao).
+        type: string
+        default: '70'
+      tooling-ref:
+        description: Ref deste repositorio (IgorOCosta/workflows) de onde vem tooling/. Acompanhe a versao do `uses`.
+        type: string
+        default: v1
+    secrets:
+      AUTOMATION_TOKEN:
+        description: Token da organizacao (PAT fine-grained ou GitHub App) com acesso a Projects.
+        required: false
+
+jobs:
+  # ===========================================================================
+  # 1. Rotula issues por conteudo.
+  # ===========================================================================
+  triage-issue:
+    name: Rotular issue
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            // Normaliza: minusculas e sem acento, para "nao funciona" casar
+            // com "não funciona" e "seguranca" com "segurança".
+            const text = `${issue.title}\n${issue.body ?? ''}`
+              .toLowerCase()
+              .normalize('NFD')
+              .replace(/[̀-ͯ]/g, '');
+
+            // Labels canonicas: CONVENCOES.md, secao "Labels".
+            const RULES = [
+              { label: 'bug',            color: 'd73a4a', test: /\b(bug|erro|falha|quebrad\w*|nao funciona|crash|exception)\b/ },
+              { label: 'feature',        color: '0e8a16', test: /\b(feature|funcionalidade|nova tela|proposta|gostaria de)\b/ },
+              { label: 'documentacao',   color: '0075ca', test: /\b(docs?|documenta\w*|readme|guia)\b/ },
+              { label: 'seguranca',      color: 'b60205', test: /\b(seguranca|security|xss|csrf|injection|vulnerab\w*|cve|token vazad\w*)\b/ },
+              { label: 'performance',    color: 'fbca04', test: /\b(performance|lento|lentidao|bundle|lcp|cls|inp|latencia|timeout)\b/ },
+              { label: 'acessibilidade', color: '7057ff', test: /\b(a11y|acessibilidade|leitor de tela|screen reader|contraste)\b/ },
+              { label: 'dependencias',   color: '0366d6', test: /\b(dependencia\w*|upgrade|bump|package\.json|lockfile)\b/ },
+              { label: 'ci-cd',          color: '5319e7', test: /\b(ci|cd|pipeline|workflow|deploy|github actions)\b/ },
+              { label: 'contrato-api',   color: '1d76db', test: /\b(openapi|contrato|endpoint|breaking change)\b/ },
+              { label: 'tech-debt',      color: 'c2e0c6', test: /\b(tech[- ]debt|divida tecnica|refator\w*|gambiarra)\b/ },
+            ];
+
+            const PRIORITY = [
+              { label: 'prioridade:alta', color: 'e11d21', test: /\b(critico|urgente|producao fora|bloqueia|p0|p1)\b/ },
+            ];
+
+            const wanted = [...RULES, ...PRIORITY].filter((rule) => rule.test.test(text));
+
+            // `size:grande` e um palpite barato para ajudar no refinamento.
+            if ((issue.body ?? '').length > 1500) {
+              wanted.push({ label: 'size:grande', color: 'c5def5' });
+            }
+
+            const existing = new Set(issue.labels.map((label) => label.name));
+            if (wanted.length === 0 && existing.size === 0) {
+              wanted.push({ label: 'triagem-pendente', color: 'ededed' });
+            }
+
+            for (const rule of wanted) {
+              try {
+                await github.rest.issues.createLabel({ ...context.repo, name: rule.label, color: rule.color });
+              } catch (error) {
+                // 422 = a label ja existe. Qualquer outro erro e real.
+                if (error.status !== 422) throw error;
+              }
+            }
+
+            const toAdd = wanted.map((rule) => rule.label).filter((name) => !existing.has(name));
+            if (toAdd.length > 0) {
+              await github.rest.issues.addLabels({ ...context.repo, issue_number: issue.number, labels: toAdd });
+              core.notice(`Labels aplicadas: ${toAdd.join(', ')}`);
+            } else {
+              core.info('Nenhuma label nova a aplicar.');
+            }
+
+  # ===========================================================================
+  # 2. Adiciona issues e PRs ao GitHub Project.
+  # ===========================================================================
+  add-to-project:
+    name: Adicionar ao Project
+    if: >-
+      inputs.project-url != '' &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name == 'issues' ||
+       (github.event_name == 'pull_request' && github.event.action == 'opened'))
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verificar token
+        env:
+          AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+        run: |
+          if [ -z "$AUTOMATION_TOKEN" ]; then
+            echo "::error title=AUTOMATION_TOKEN ausente::PROJECT_URL esta definido, mas o GITHUB_TOKEN nao enxerga Projects v2. Configure AUTOMATION_TOKEN (SETUP-GITHUB.md)."
+            exit 1
+          fi
+
+      - uses: actions/add-to-project@v1
+        with:
+          project-url: ${{ inputs.project-url }}
+          github-token: ${{ secrets.AUTOMATION_TOKEN }}
+
+  # ===========================================================================
+  # 3. Diagnostico de convencoes + sugestao de reviewers no PR.
+  # ===========================================================================
+  review-pr:
+    name: Diagnostico do PR
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Regras centrais (IgorOCosta/workflows, tooling/)
+        uses: actions/checkout@v4
+        with:
+          repository: IgorOCosta/workflows
+          ref: ${{ inputs.tooling-ref }}
+          path: .workflows-tooling
+          sparse-checkout: tooling
+
+      # As MESMAS regras que o CI aplica. Aqui so viram texto de ajuda.
+      # GITHUB_ACTIONS vazio: sem anotacoes duplicadas (o CI ja as emite).
+      - name: Avaliar convencoes
+        env:
+          BRANCH: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tooling=.workflows-tooling/tooling
+          mkdir -p .agent
+          GITHUB_ACTIONS='' sh "$tooling/check-branch-name.sh" "$BRANCH" > .agent/branch.log 2>&1 \
+            && echo ok > .agent/branch.status || echo fail > .agent/branch.status
+          printf '%s\n' "$PR_TITLE" | GITHUB_ACTIONS='' sh "$tooling/check-commit-message.sh" - > .agent/title.log 2>&1 \
+            && echo ok > .agent/title.status || echo fail > .agent/title.status
+          GITHUB_ACTIONS='' sh "$tooling/check-commit-range.sh" "$BASE_SHA" "$HEAD_SHA" > .agent/commits.log 2>&1 \
+            && echo ok > .agent/commits.status || echo fail > .agent/commits.status
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- agent:pr-conventions -->';
+            const pr = context.payload.pull_request;
+
+            const read = (name) => fs.readFileSync(`.agent/${name}`, 'utf8').trim();
+            const details = (log) => `\n\n<details><summary>detalhes</summary>\n\n\`\`\`\n${log}\n\`\`\`\n</details>`;
+
+            const checks = [
+              { key: 'title',   name: 'Titulo do PR (Conventional Commits)', okText: `\`${pr.title}\`` },
+              { key: 'branch',  name: 'Nome da branch',                       okText: `\`${pr.head.ref}\`` },
+              { key: 'commits', name: 'Commits do PR',                        okText: 'Todos seguem Conventional Commits.' },
+            ].map((check) => {
+              const ok = read(`${check.key}.status`) === 'ok';
+              return { ...check, ok, detail: ok ? check.okText : `Fora do padrao.${details(read(`${check.key}.log`))}` };
+            });
+
+            // Issue vinculada.
+            const closes = [...(pr.body ?? '').matchAll(/\b(?:closes|fixes|resolves|close|fix|resolve)\s+#(\d+)/gi)]
+              .map((match) => match[1]);
+            checks.push({
+              ok: closes.length > 0,
+              name: 'Issue vinculada',
+              detail: closes.length > 0
+                ? closes.map((n) => `#${n}`).join(', ')
+                : 'Nenhuma. Use `Closes #N` na descricao para fechar a issue no merge.',
+            });
+
+            // Sugestao de reviewers via CODEOWNERS (vale a ULTIMA regra que casa).
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: pr.number, per_page: 100,
+            });
+
+            let ownersLine = '_CODEOWNERS nao encontrado._';
+            const codeownersPath = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'].find((p) => fs.existsSync(p));
+            if (codeownersPath) {
+              const rules = fs.readFileSync(codeownersPath, 'utf8')
+                .split('\n')
+                .map((line) => line.replace(/#.*$/, '').trim())
+                .filter(Boolean)
+                .map((line) => {
+                  const [pattern, ...owners] = line.split(/\s+/);
+                  return { pattern, owners };
+                });
+
+              const matches = (pattern, filePath) => {
+                if (pattern === '*') return true;
+                const clean = pattern.replace(/^\//, '');
+                if (clean.endsWith('/')) return filePath.startsWith(clean);
+                if (clean.startsWith('*.')) return filePath.endsWith(clean.slice(1));
+                return filePath === clean || filePath.startsWith(`${clean}/`);
+              };
+
+              const owners = new Set();
+              for (const file of files) {
+                const rule = [...rules].reverse().find((candidate) => matches(candidate.pattern, file.filename));
+                rule?.owners.forEach((owner) => owners.add(owner));
+              }
+              const suggested = [...owners].filter((owner) => owner !== `@${pr.user.login}`);
+              ownersLine = suggested.length > 0 ? suggested.join(', ') : '_Nenhum owner especifico para estes arquivos._';
+            }
+
+            const failing = checks.filter((check) => !check.ok);
+            const body = [
+              MARKER,
+              `### Diagnostico do agente${failing.length === 0 ? ' — tudo certo' : ''}`,
+              '',
+              '_Informativo. Quem bloqueia o merge e o workflow `CI` (check `ci-success`)._',
+              '',
+              ...checks.map((check) => `- ${check.ok ? '[x]' : '[ ]'} **${check.name}** — ${check.detail}`),
+              '',
+              `**Reviewers sugeridos (CODEOWNERS):** ${ownersLine}`,
+              '',
+              `<sub>${files.length} arquivo(s) alterado(s) · atualizado em ${new Date().toISOString()}</sub>`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: pr.number, per_page: 100,
+            });
+            const previous = comments.find((comment) => comment.body?.includes(MARKER));
+            if (previous) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: pr.number, body });
+            }
+
+            // A label so sinaliza; nao impede o merge.
+            const label = 'convencoes-pendentes';
+            try {
+              await github.rest.issues.createLabel({ ...context.repo, name: label, color: 'fef2c0' });
+            } catch (error) {
+              if (error.status !== 422) throw error;
+            }
+            if (failing.length > 0) {
+              await github.rest.issues.addLabels({ ...context.repo, issue_number: pr.number, labels: [label] });
+            } else {
+              await github.rest.issues.removeLabel({ ...context.repo, issue_number: pr.number, name: label }).catch(() => {});
+            }
+
+  # ===========================================================================
+  # 4. Resultado do CI e cobertura como comentario fixo no PR.
+  #    Roda depois que o workflow "CI" termina, para ler os artefatos do run.
+  # ===========================================================================
+  report-ci:
+    name: Comentar resultado do CI
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Baixar cobertura do run do CI
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: coverage
+          path: coverage
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/github-script@v7
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+        with:
+          script: |
+            const MARKER = '<!-- agent:ci-report -->';
+            const run = context.payload.workflow_run;
+
+            // `pull_requests` vem vazio em PR de fork: cai na busca por SHA.
+            let prNumber = run.pull_requests?.[0]?.number;
+            if (!prNumber) {
+              const { data } = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${context.repo.owner}/${context.repo.repo} is:pr sha:${run.head_sha}`,
+              });
+              prNumber = data.items?.[0]?.number;
+            }
+            if (!prNumber) {
+              core.info('Nenhum PR associado a este run. Nada a comentar.');
+              return;
+            }
+
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+              ...context.repo, run_id: run.id, per_page: 100,
+            });
+
+            const ICON = { success: '✅', failure: '❌', cancelled: '⚪', skipped: '⏭️', neutral: '➖' };
+            const rows = jobs
+              .filter((job) => !job.name.endsWith('ci-success'))
+              .map((job) => {
+                const status = job.conclusion ?? 'neutral';
+                return `| ${ICON[status] ?? '❔'} | [${job.name}](${job.html_url}) | \`${status}\` |`;
+              });
+
+            // Cobertura: coverage-summary.json (Istanbul/Vitest/Jest) quando
+            // existe; senao lcov.info, que quase toda ferramenta sabe gerar.
+            const THRESHOLD = Number(process.env.COVERAGE_THRESHOLD || 70);
+            const fs = require('fs');
+            let coverageBlock = '_Relatorio de cobertura indisponivel neste run (o contrato espera coverage/lcov.info)._';
+
+            const row = (label, pct, covered, total) => {
+              const mark = pct >= THRESHOLD ? '✅' : '⚠️';
+              return `| ${label} | ${pct.toFixed(2)}% | ${covered}/${total} | ${mark} |`;
+            };
+            const header = [`| Metrica | % | Coberto | Meta ${THRESHOLD}% |`, '| --- | ---: | ---: | :---: |'];
+
+            if (fs.existsSync('coverage/coverage-summary.json')) {
+              const total = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8')).total;
+              coverageBlock = [
+                ...header,
+                row('Linhas', total.lines.pct, total.lines.covered, total.lines.total),
+                row('Statements', total.statements.pct, total.statements.covered, total.statements.total),
+                row('Funcoes', total.functions.pct, total.functions.covered, total.functions.total),
+                row('Branches', total.branches.pct, total.branches.covered, total.branches.total),
+              ].join('\n');
+            } else if (fs.existsSync('coverage/lcov.info')) {
+              const totals = { LF: 0, LH: 0, FNF: 0, FNH: 0, BRF: 0, BRH: 0 };
+              for (const line of fs.readFileSync('coverage/lcov.info', 'utf8').split('\n')) {
+                const [key, value] = line.trim().split(':');
+                if (key in totals) totals[key] += Number(value) || 0;
+              }
+              const pct = (hit, found) => (found === 0 ? 100 : (hit / found) * 100);
+              const lines = [row('Linhas', pct(totals.LH, totals.LF), totals.LH, totals.LF)];
+              if (totals.FNF > 0) lines.push(row('Funcoes', pct(totals.FNH, totals.FNF), totals.FNH, totals.FNF));
+              if (totals.BRF > 0) lines.push(row('Branches', pct(totals.BRH, totals.BRF), totals.BRH, totals.BRF));
+              coverageBlock = [...header, ...lines].join('\n');
+            }
+
+            const body = [
+              MARKER,
+              `### Resultado do CI — ${run.conclusion === 'success' ? '✅ passou' : `❌ ${run.conclusion}`}`,
+              '',
+              '| | Job | Resultado |',
+              '| :-: | --- | --- |',
+              ...rows,
+              '',
+              '#### Cobertura',
+              '',
+              coverageBlock,
+              '',
+              `<sub>Commit \`${run.head_sha.slice(0, 7)}\` · [run completo](${run.html_url})</sub>`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo, issue_number: prNumber, per_page: 100,
+            });
+            const previous = comments.find((comment) => comment.body?.includes(MARKER));
+            if (previous) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: prNumber, body });
+            }
+
+  # ===========================================================================
+  # 5. Fecha issues referenciadas por "Closes #N" quando o PR e mergeado.
+  #    O GitHub ja faz isso para PRs que miram a branch padrao; este job
+  #    cobre o resto (keyword so no corpo de um commit, base != main).
+  # ===========================================================================
+  close-linked-issues:
+    name: Fechar issues vinculadas
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const KEYWORDS = /\b(?:closes|closed|close|fixes|fixed|fix|resolves|resolved|resolve)\s+#(\d+)/gi;
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              ...context.repo, pull_number: pr.number, per_page: 100,
+            });
+            const sources = [pr.body ?? '', ...commits.map((commit) => commit.commit.message)];
+            const numbers = new Set(sources.flatMap((text) => [...text.matchAll(KEYWORDS)].map((m) => Number(m[1]))));
+
+            if (numbers.size === 0) {
+              core.info('Nenhuma issue referenciada.');
+              return;
+            }
+
+            for (const number of numbers) {
+              try {
+                const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number });
+                if (issue.pull_request || issue.state === 'closed') continue;
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: number,
+                  body: `Fechada automaticamente pelo merge de #${pr.number} em \`${pr.base.ref}\`.`,
+                });
+                await github.rest.issues.update({
+                  ...context.repo, issue_number: number, state: 'closed', state_reason: 'completed',
+                });
+                core.notice(`Issue #${number} fechada.`);
+              } catch (error) {
+                core.warning(`Nao foi possivel fechar #${number}: ${error.message}`);
+              }
+            }

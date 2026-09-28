@@ -1,0 +1,52 @@
+# =============================================================================
+# Release do proprio repositorio de workflows.
+#
+# Os projetos chamam os workflows reutilizaveis por `@v1`. A cada release
+# vX.Y.Z publicada aqui, a tag major (`v1`) e movida para ela — e todos os
+# projetos passam a usar a versao nova no proximo run, sem PR em cada um.
+#
+# Mudanca incompativel (input removido, comportamento que quebra quem chama)
+# = commit `feat!:` -> release v2.0.0 -> tag `v2`. Projetos em `@v1` nao sao
+# afetados ate migrarem de proposito.
+# =============================================================================
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.AUTOMATION_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - uses: actions/checkout@v4
+        if: steps.release.outputs.release_created == 'true'
+
+      - name: Mover a tag major
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          MAJOR: ${{ steps.release.outputs.major }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          git tag -f "v$MAJOR" "$SHA"
+          git push -f origin "refs/tags/v$MAJOR"
+          echo "### Tag \`v$MAJOR\` agora aponta para \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"

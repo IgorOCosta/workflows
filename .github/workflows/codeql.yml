@@ -1,0 +1,78 @@
+# =============================================================================
+# REUTILIZAVEL — CodeQL (SAST) do codigo do projeto.
+#
+# Cobre o que o linter nao cobre: fluxo de dados entre arquivos (injecao,
+# XSS, redirect aberto, dado nao sanitizado chegando a um sink).
+#
+# `languages` aceita lista separada por virgula. Valores validos:
+#   javascript-typescript, python, java-kotlin, csharp, go, ruby, swift,
+#   c-cpp, rust, actions
+#
+# `build-mode`:
+#   vazio      -> padrao do CodeQL (none para interpretadas, autobuild para compiladas)
+#   none       -> sem build (interpretadas; java/csharp tambem suportam)
+#   autobuild  -> o CodeQL tenta compilar sozinho
+#   manual     -> roda `make setup` e `make build` do projeto
+#
+# Sem `languages` no projeto (antes do bootstrap), FALHA com instrucao. No
+# repositorio template e pulado.
+#
+# Os alertas aparecem em Security -> Code scanning. Para BLOQUEAR o merge,
+# ative "Require code scanning results" nas regras da branch.
+# =============================================================================
+name: CodeQL
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        type: string
+        required: true
+      build-mode:
+        type: string
+        default: ''
+      queries:
+        description: security-and-quality (padrao) ou security-extended, se o ruido inicial atrapalhar.
+        type: string
+        default: security-and-quality
+
+jobs:
+  analyze:
+    name: Analise CodeQL
+    if: github.event.repository.is_template != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Verificar configuracao
+        env:
+          LANGUAGES: ${{ inputs.languages }}
+        run: |
+          if [ -z "$LANGUAGES" ]; then
+            echo "::error title=CodeQL sem linguagem::Defina a variable CODEQL_LANGUAGES do repositorio (ex.: python, go, java-kotlin). Ver SETUP-GITHUB.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        if: inputs.build-mode == 'manual' && hashFiles('.tool-versions', 'mise.toml', '.mise.toml') != ''
+        with:
+          cache: true
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.languages }}
+          build-mode: ${{ inputs.build-mode }}
+          queries: ${{ inputs.queries }}
+
+      - name: Build manual
+        if: inputs.build-mode == 'manual'
+        run: make setup && make build
+
+      - name: Analisar
+        uses: github/codeql-action/analyze@v3

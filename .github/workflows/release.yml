@@ -1,0 +1,66 @@
+# =============================================================================
+# REUTILIZAVEL — Versionamento e CHANGELOG a partir de Conventional Commits.
+#
+# Usa o release-please: a cada push em main ele mantem aberto um PR de release
+# ("chore(main): release X.Y.Z") com a versao calculada pelos commits e o
+# CHANGELOG.md atualizado. Mergear esse PR cria a tag vX.Y.Z e a GitHub
+# Release — e a release publicada dispara o deploy para `prod` (com a
+# aprovacao do Environment).
+#
+#   fix:   -> patch      feat: -> minor      feat!: / BREAKING CHANGE -> major
+#   (antes da 1.0.0, breaking sobe o minor: bump-minor-pre-major)
+#
+# A configuracao fica no projeto: release-please-config.json e
+# .release-please-manifest.json. O `release-type` comeca `simple` e e trocado
+# no bootstrap pelo da stack (node, python, go, java...).
+#
+# TOKEN: com o GITHUB_TOKEN padrao, o PR de release NAO dispara o CI e a
+# release NAO dispara o deploy (regra do GitHub contra loops). Por isso o
+# AUTOMATION_TOKEN da organizacao e o recomendado. Sem ele, o workflow usa o
+# GITHUB_TOKEN e exige "Allow GitHub Actions to create and approve pull
+# requests" ligado.
+#
+# No repositorio TEMPLATE o job e pulado: templates nao geram release.
+# =============================================================================
+name: Release
+
+on:
+  workflow_call:
+    secrets:
+      AUTOMATION_TOKEN:
+        required: false
+    outputs:
+      release-created:
+        description: "'true' quando este run publicou uma release"
+        value: ${{ jobs.release-please.outputs.release-created }}
+      tag-name:
+        description: 'Tag da release publicada, por exemplo v1.4.0'
+        value: ${{ jobs.release-please.outputs.tag-name }}
+
+jobs:
+  release-please:
+    name: Release
+    if: github.event.repository.is_template != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Aviso de token
+        env:
+          AUTOMATION_TOKEN: ${{ secrets.AUTOMATION_TOKEN }}
+        run: |
+          if [ -z "$AUTOMATION_TOKEN" ]; then
+            echo "::warning title=Release sem AUTOMATION_TOKEN::Usando GITHUB_TOKEN: o PR de release nao dispara o CI e a release nao dispara o deploy. Ver SETUP-GITHUB.md."
+          fi
+
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.AUTOMATION_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

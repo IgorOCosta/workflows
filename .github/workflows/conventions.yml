@@ -1,0 +1,62 @@
+# =============================================================================
+# REUTILIZAVEL — Convencoes de branch, commits e titulo de PR.
+#
+# Usa as regras CENTRAIS de tooling/ (este repositorio), nao a copia que cada
+# projeto carrega em scripts/. Assim, corrigir uma regra aqui corrige o CI de
+# todos os projetos que chamam @v1 — sem PR em cada um.
+#
+# Uso (no ci.yml do projeto):
+#
+#   conventions:
+#     if: github.event_name == 'pull_request'
+#     uses: IgorOCosta/workflows/.github/workflows/conventions.yml@v1
+#
+# Branches de automacao (dependabot/, renovate/, release-please--) sao isentas
+# da regra de nome; os commits e o titulo delas continuam validados.
+# =============================================================================
+name: Convencoes
+
+on:
+  workflow_call:
+    inputs:
+      tooling-ref:
+        description: Ref deste repositorio (IgorOCosta/workflows) de onde vem tooling/. Acompanhe a versao do `uses`.
+        type: string
+        default: v1
+
+jobs:
+  conventions:
+    name: Convencoes (branch + commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Regras centrais (IgorOCosta/workflows, tooling/)
+        uses: actions/checkout@v4
+        with:
+          repository: IgorOCosta/workflows
+          ref: ${{ inputs.tooling-ref }}
+          path: .workflows-tooling
+          sparse-checkout: tooling
+
+      - name: Nome da branch
+        # Passado por env, nunca interpolado: nome de branch e entrada externa.
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: sh .workflows-tooling/tooling/check-branch-name.sh "$BRANCH"
+
+      - name: Commits do PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: sh .workflows-tooling/tooling/check-commit-range.sh "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Titulo do PR (vira a mensagem do squash merge)
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$PR_TITLE" | sh .workflows-tooling/tooling/check-commit-message.sh -
