@@ -44,7 +44,9 @@ for template in $TEMPLATES; do
   for name in $REUSABLE; do
     cp "$base/.github/workflows/$name.yml" "$dir/.github/workflows/reusable-$name.yml"
   done
-  for file in "$src"/*.yml; do
+  # Os workflows guardados em producao/ (fase de producao) tambem sao validados.
+  for file in "$src"/*.yml "$root/$template/producao/.github/workflows"/*.yml; do
+    [ -f "$file" ] || continue
     sed -E 's#IgorOCosta/workflows/\.github/workflows/([a-z-]+)\.yml@v1#./.github/workflows/reusable-\1.yml#' \
       "$file" > "$dir/.github/workflows/$(basename "$file")"
   done
